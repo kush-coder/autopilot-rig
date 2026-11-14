@@ -1,0 +1,310 @@
+//! What the rules find: each kind by its shape, where a token starts, and
+//! nothing that only looks like the start of a key.
+
+use serde_json::json;
+
+use super::*;
+
+/// One key of every kind, each found whole, and redacted once.
+#[test]
+fn every_kind_is_found_by_its_shape_and_redacted() {
+    let keys = [
+        (
+            "sk-proj-abcdefghijklmnopqrstuvwxyz1234567890",
+            Kind::OpenAiApiKey,
+        ),
+        ("sk-svcacct-abcdefghijklmnop1234", Kind::OpenAiApiKey),
+        (
+            "sk-abcdefghijklmnopqrstuvwxyz1234567890",
+            Kind::OpenAiApiKey,
+        ),
+        (
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890",
+            Kind::AnthropicApiKey,
+        ),
+        ("AIzaSyExampleSecretToken1234567890", Kind::GoogleApiKey),
+        ("AKIA1234567890ABCDEF", Kind::AwsAccessKey),
+        ("ASIA0123456789ABCDEF", Kind::AwsAccessKey),
+        (
+            "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            Kind::GitHubToken,
+        ),
+        (
+            "github_pat_11ABCDEFG0123456789_abcdefghij",
+            Kind::GitHubToken,
+        ),
+        ("glpat-abcdefghij0123456789", Kind::GitLabToken),
+        ("xoxb-1234567890-abcdefghij", Kind::SlackToken),
+        ("sk_live_abcdefghij0123456789", Kind::StripeKey),
+        (
+            "hf_abcdefghijklmnopqrstuvwxyz0123456789",
+            Kind::HuggingFaceToken,
+        ),
+        (
+            "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLWJ5dGVz",
+            Kind::JsonWebToken,
+        ),
+        (
+            "eyJhbGciOiJub25lIn0.eyJzdWIiOiIxMjM0In0.",
+            Kind::JsonWebToken,
+        ),
+        (
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk=\n-----END OPENSSH PRIVATE KEY-----",
+            Kind::PrivateKey,
+        ),
+    ];
+    for (key, kind) in keys {
+        let line = format!("before \"{key}\", after");
+        let found: Vec<SecretMatch> = find(&line).collect();
+        let start = "before \"".len();
+        assert_eq!(
+            found,
+            [SecretMatch {
+                kind,
+                range: start..start + key.len()
+            }],
+            "{key}"
+        );
+        let redacted = text(&line);
+        assert_eq!(redacted, format!("before \"{REDACTED}\", after"));
+        assert!(!has_secret(&redacted));
+    }
+}
+
+/// Key prefixes inside a word or a base64 blob, and prefixes with a short
+/// or letterless tail, are not keys; text without one is not copied.
+#[test]
+fn only_a_whole_token_of_a_key_shape_is_a_key() {
+    let harmless = [
+        "the sk-etch marker is harmless",
+        "sk-12345678901234567890123456789012345",
+        "rig-file-id-page-two-verifier-8c27 file_011Cb1W1wnAxQP1a6AuVcPx5",
+        "ErUBCkYIBRgCIkAIzaSyExampleSecretToken1234567890ABCDEFGHIJAKIA0123456789ABCDEFsk-proj-notakeyhereatall0123456789abcdef",
+        "Eq/AIzaSyExampleSecretToken1234567890ABCDEFGHIJ+AKIA0123456789ABCDEF==",
+        "AKIA0123456789ABCDEFG is one letter too long",
+        "-----BEGIN PUBLIC KEY-----\nMFkw\n-----END PUBLIC KEY-----",
+        "eyJhbGciOiJSUzI1NiJ9 alone, or eyJhbGciOiJSUzI1NiJ9.eyJz.c2ln with a short payload",
+        "theyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2ln inside a word",
+    ];
+    for line in harmless {
+        assert!(matches!(text(line), Cow::Borrowed(_)), "{line}");
+    }
+}
+
+/// Every string of a JSON value is redacted, keys and other values are
+/// kept, a private key cut off mid-block is redacted to the end, and only
+/// a value that held a secret says it changed.
+#[test]
+fn json_redacts_every_string_and_a_cut_off_key_to_the_end() {
+    let mut value = json!({
+        "sk-abcdefghijklmnopqrstuvwxyz1234567890": 1,
+        "headers": ["Bearer ghp_abcdefghijklmnopqrstuvwxyz0123456789", "plain"],
+        "chunk": "key: -----BEGIN RSA PRIVATE KEY-----\nMIIEow",
+        "count": 7,
+    });
+    assert!(json(&mut value));
+    assert!(!json(&mut json!({ "a": ["b"] })));
+    // A provider's raw arguments, JSON in a string: the escape before the
+    // key does not hide it.
+    let raw = r#"{"content":"\nghp_abcdefghijklmnopqrstuvwxyz0123456789"}"#;
+    let mut native = json!({ "arguments": raw });
+    assert!(json(&mut native));
+    assert_eq!(
+        native,
+        json!({ "arguments": r#"{"content":"\n[REDACTED]"}"# })
+    );
+    // With space before it, and a secret named in it, as text finds it.
+    let mut spaced = json!(format!(" {raw}"));
+    assert!(json(&mut spaced));
+    assert_eq!(spaced, json!(r#"{"content":"\n[REDACTED]"}"#));
+    let mut named = json!(r#"{"PASSWORD":"hunter2hunter2"}"#);
+    assert!(json(&mut named));
+    assert!(!named.to_string().contains("hunter2"), "{named}");
+    assert_eq!(
+        value,
+        json!({
+            "sk-abcdefghijklmnopqrstuvwxyz1234567890": 1,
+            "headers": [format!("Bearer {REDACTED}"), "plain"],
+            "chunk": format!("key: {REDACTED}"),
+            "count": 7,
+        })
+    );
+}
+
+/// A value assigned to a secret-named variable is redacted with the name
+/// kept; a count, a reference, a short value and a name that only holds a
+/// secret word are not secrets, and a known key keeps its own kind.
+#[test]
+fn a_value_assigned_to_a_secret_name_is_redacted_and_counts_are_not() {
+    // A sentence's full stop after the value is not part of it.
+    assert_eq!(
+        text("The password is DB_PASSWORD=hunter2hunter2. Write it."),
+        "The password is DB_PASSWORD=[REDACTED]. Write it."
+    );
+    // Unless the value is too short without it.
+    assert_eq!(text("DB_PASSWORD=abcdefg!"), "DB_PASSWORD=[REDACTED]");
+    // Not when it is no value without it.
+    assert_eq!(text("DB_PASSWORD=20241031."), "DB_PASSWORD=20241031.");
+    let line = "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY region=us-east-1";
+    assert_eq!(
+        text(line),
+        "AWS_SECRET_ACCESS_KEY=[REDACTED] region=us-east-1"
+    );
+    assert_eq!(
+        text(r#"{"DB_PASSWORD": "correct horse battery", "GITHUB_TOKEN": 'abcdefgh'}"#),
+        r#"{"DB_PASSWORD": "[REDACTED]", "GITHUB_TOKEN": '[REDACTED]'}"#
+    );
+    assert_eq!(
+        text("?API_KEY=abcdefghij&page=2"),
+        "?API_KEY=[REDACTED]&page=2"
+    );
+    for kept in [
+        "MAX_TOKENS=4096",
+        "TOKEN_COUNT=12345678",
+        "MAX_TOKENS_PER_CALL=unlimited",
+        "TOKEN_BUDGET=generous-enough",
+        "GH_TOKEN=$GITHUB_TOKEN",
+        "API_KEY=short",
+        "my_token=abcdefghijk",
+        "API_KEY=[REDACTED]",
+        "API_KEY=‹SECRET_1›",
+    ] {
+        assert_eq!(text(kept), kept);
+    }
+    let shaped: Vec<Kind> = find("GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789")
+        .map(|secret| secret.kind)
+        .collect();
+    assert_eq!(shaped, [Kind::GitHubToken]);
+}
+
+/// A text redacted in pieces, cut anywhere, joins to the text redacted
+/// whole: no secret the whole holds is shown, however it streams.
+#[test]
+fn a_streamed_text_redacts_as_the_whole_text_wherever_it_is_cut() {
+    let texts = [
+        "Set OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234 first, then run it.",
+        "export GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\nnext",
+        "PASSWORD: hunter2hunter2 and DB_PASSWORD = \"two words here\" end",
+        "id AKIA0123456789ABCDEF and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2ln done",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nabcd\n-----END RSA PRIVATE KEY-----\nafter",
+        "-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA never ends",
+        "Prose with é and 日本語の文 words, no key, MAX_TOKENS=4096 and TOKEN_COUNT: 12345678.",
+        "https://example.com/a+b/sk-proj-abcdefghijklmnop1234,(ghp_abcdefghijklmnopqrstuvwxyz0123456789)",
+        "\"API_KEY\": \"abcdefgh12345678\", \"name\": \"x\"\n\tSECRET=$HOME",
+        "Export it (GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789).",
+        "PASSWORD=\"sk-proj-abcdefghijklmnop1234 trailing\" then",
+        "AKIA0123456789ABCDEFghp_abcdefghijklmnopqrstuvwxyz0123456789 and AKIA0123456789ABCDEFsk-proj-abcdefghijklmnop1234",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----TOKEN=abcdefgh12345678",
+        "TOKEN=\"key: -----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----\" after",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY----- API_KEY=abcdefgh12345678",
+    ];
+    for input in texts {
+        let whole = text(input).into_owned();
+        // Redacting it again changes nothing, as a front that redacts what
+        // it writes does.
+        assert_eq!(text(&whole), whole);
+        let cuts: Vec<usize> = (0..=input.len())
+            .filter(|&at| input.is_char_boundary(at))
+            .collect();
+        // Every cut into two pieces, and the text one character at a time.
+        let splits = cuts.iter().map(|&at| vec![&input[..at], &input[at..]]);
+        let chars = cuts
+            .windows(2)
+            .map(|pair| &input[pair[0]..pair[1]])
+            .collect::<Vec<_>>();
+        for pieces in splits.chain(std::iter::once(chars)) {
+            let mut streamed = Streamed::default();
+            let mut shown: String = pieces
+                .iter()
+                .map(|piece| text(&streamed.push(piece)).into_owned())
+                .collect();
+            shown += &text(&streamed.finish());
+            assert_eq!(shown, whole, "{pieces:?}");
+        }
+    }
+}
+
+/// Past `HELD_MOST`, a run of key characters with no end, such as a base64
+/// blob, streams instead of being held whole, and a key still forming at
+/// the end of a long line that names a secret is still held.
+#[test]
+fn a_streamed_text_past_its_bound_streams_and_still_holds_a_forming_key() {
+    let mut streamed = Streamed::default();
+    let piece = "a".repeat(100);
+    let shown = (0..400).map(|_| streamed.push(&piece).len()).sum::<usize>();
+    assert!(400 * 100 - shown <= HELD_MOST + 100, "{shown}");
+    let rest = streamed.finish();
+    assert_eq!(shown + rest.len(), 400 * 100);
+    // A piece that carries what is held past the bound while a key block is
+    // open, on its own line or after the prose, or ended, still holds it.
+    let words = "word ".repeat(3300);
+    let body = "EowIBAAKCAQEA\nabcd\n-----END RSA PRIVATE KEY-----\nafter";
+    let open = [
+        format!("{words}\n-----BEGIN RSA PRIVATE KEY-----\nMII"),
+        format!("{words}-----BEGIN RSA PRIVATE KEY-----\nMII"),
+    ];
+    let ended =
+        format!("{words}\n-----BEGIN RSA PRIVATE KEY-----\nMII\n-----END RSA PRIVATE KEY-----");
+    // And a whole key before them on the line, which the bound would cut.
+    let key = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let after_key = format!(
+        "{key} {}-----BEGIN RSA PRIVATE KEY-----\nMII",
+        "word ".repeat(3266)
+    );
+    let cases = open
+        .iter()
+        .chain([&after_key])
+        .map(|first| vec![first.as_str(), body]);
+    for pieces in cases.chain([vec![ended.as_str()]]) {
+        let mut streamed = Streamed::default();
+        let mut shown: String = pieces
+            .iter()
+            .map(|piece| text(&streamed.push(piece)).into_owned())
+            .collect();
+        shown += &text(&streamed.finish());
+        assert_eq!(shown, text(&pieces.concat()));
+    }
+    // A key, or an assigned value with its name and quotes, on a held line
+    // the bound lets go of a few bytes at a time.
+    for line in [
+        format!("TOKEN note: {key} {}", "word ".repeat(3300)),
+        format!("GITHUB_TOKEN=abcdefgh12345678 {}", "word ".repeat(3300)),
+        format!("TOKEN=\"abcdefgh12345678\" {}", "word ".repeat(3300)),
+    ] {
+        let pieces: Vec<&str> = line
+            .as_bytes()
+            .chunks(5)
+            .filter_map(|piece| std::str::from_utf8(piece).ok())
+            .collect();
+        let mut streamed = Streamed::default();
+        let mut shown: String = pieces
+            .iter()
+            .map(|piece| text(&streamed.push(piece)).into_owned())
+            .collect();
+        shown += &text(&streamed.finish());
+        assert_eq!(shown, text(&line));
+    }
+    for line in [
+        format!("TOKEN {}gh", "word ".repeat(3275)),
+        format!("one {}API_KEY=abcd", "word ".repeat(3275)),
+    ] {
+        let pieces = [line.as_str(), "p_", "efghijklmnopqrstuvwxyz0123456789 end"];
+        let mut streamed = Streamed::default();
+        let mut shown: String = pieces
+            .iter()
+            .map(|piece| text(&streamed.push(piece)).into_owned())
+            .collect();
+        shown += &text(&streamed.finish());
+        assert_eq!(shown, text(&pieces.concat()), "{}", &line[..8]);
+    }
+}
+
+/// A secret right after another, with no space between, is found too: what
+/// follows a secret starts a token, as it does once the first is redacted.
+#[test]
+fn a_secret_right_after_another_is_found_too() {
+    let glued = "AKIA0123456789ABCDEFghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    assert_eq!(text(glued), "[REDACTED][REDACTED]");
+    let after_a_block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----TOKEN=abcdefgh12345678";
+    assert_eq!(text(after_a_block), "[REDACTED]TOKEN=[REDACTED]");
+}

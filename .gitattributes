@@ -1,0 +1,9 @@
+crates/rig-cassette/fixtures/cassettes/doubleword/**/*.yaml whitespace=-blank-at-eof
+# Cassette recordings preserve wire bytes verbatim; SSE bodies end with a
+# blank line that YAML block scalars represent at EOF. Exempt them from the
+# blank-at-eof whitespace check so `git diff --check` stays meaningful
+# elsewhere without corrupting recordings.
+crates/rig-cassette/fixtures/cassettes/** whitespace=-blank-at-eof
+# Sync writes the catalog with LF line ends, and `cargo xtask catalog check`
+# compares it byte for byte, so a CRLF checkout must not rewrite it.
+crates/rig-core/src/catalog/models.json text eol=lf
